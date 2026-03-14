@@ -1,0 +1,217 @@
+name: Validate Transaction
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'transactions/**.json'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Find transaction file
+        id: find-tx
+        run: |
+          TX_FILE=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD \
+            | grep '^transactions/[^/]*\.json$' | head -1)
+          echo "tx_file=$TX_FILE" >> $GITHUB_OUTPUT
+          echo "Found transaction file: $TX_FILE"
+
+      - name: Validate transaction
+        id: validate
+        run: |
+          TX_FILE="${{ steps.find-tx.outputs.tx_file }}"
+
+          if [ -z "$TX_FILE" ]; then
+            echo "result=error" >> $GITHUB_OUTPUT
+            echo "message=No transaction file found in this PR." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Parse transaction
+          FROM=$(jq -r '.from' "$TX_FILE")
+          TO=$(jq -r '.to' "$TX_FILE")
+          AMOUNT=$(jq -r '.amount' "$TX_FILE")
+          CURRENCY=$(jq -r '.currency' "$TX_FILE")
+          TX_ID=$(jq -r '.id' "$TX_FILE")
+          NOTE=$(jq -r '.note // ""' "$TX_FILE")
+
+          echo "Transaction: $TX_ID — $FROM → $TO  $AMOUNT $CURRENCY"
+
+          # Read sender balance from main branch
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          BALANCE_FILE="balances/${FROM}.json"
+          SENDER_BALANCE=$(git show origin/${{ github.event.pull_request.base.ref }}:$BALANCE_FILE \
+            | jq -r '.balance')
+
+          echo "Sender balance: $SENDER_BALANCE"
+
+          # Compare
+          SUFFICIENT=$(echo "$SENDER_BALANCE $AMOUNT" | awk '{print ($1 >= $2) ? "yes" : "no"}')
+
+          echo "tx_id=$TX_ID" >> $GITHUB_OUTPUT
+          echo "from=$FROM" >> $GITHUB_OUTPUT
+          echo "to=$TO" >> $GITHUB_OUTPUT
+          echo "amount=$AMOUNT" >> $GITHUB_OUTPUT
+          echo "currency=$CURRENCY" >> $GITHUB_OUTPUT
+          echo "note=$NOTE" >> $GITHUB_OUTPUT
+          echo "sender_balance=$SENDER_BALANCE" >> $GITHUB_OUTPUT
+          echo "sufficient=$SUFFICIENT" >> $GITHUB_OUTPUT
+
+          if [ "$SUFFICIENT" = "yes" ]; then
+            echo "result=approved" >> $GITHUB_OUTPUT
+          else
+            echo "result=insufficient-funds" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post approval comment
+        if: steps.validate.outputs.result == 'approved'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { from, to, amount, currency, note, sender_balance, tx_id } = {
+              from: '${{ steps.validate.outputs.from }}',
+              to: '${{ steps.validate.outputs.to }}',
+              amount: '${{ steps.validate.outputs.amount }}',
+              currency: '${{ steps.validate.outputs.currency }}',
+              note: '${{ steps.validate.outputs.note }}',
+              sender_balance: '${{ steps.validate.outputs.sender_balance }}',
+              tx_id: '${{ steps.validate.outputs.tx_id }}',
+            };
+            const newBalance = (parseFloat(sender_balance) - parseFloat(amount)).toFixed(2);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ✅ Transaction Approved',
+                '',
+                `| Field | Value |`,
+                `|-------|-------|`,
+                `| Transaction ID | \`${tx_id}\` |`,
+                `| From | **${from}** |`,
+                `| To | **${to}** |`,
+                `| Amount | **${amount} ${currency}** |`,
+                `| Note | ${note || '—'} |`,
+                `| Sender current balance | ${sender_balance} ${currency} |`,
+                `| Sender balance after settlement | ${newBalance} ${currency} |`,
+                '',
+                'Merge this PR to settle the transaction.',
+              ].join('\n'),
+            });
+
+      - name: Label approved
+        if: steps.validate.outputs.result == 'approved'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Ensure label exists
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'approved',
+                color: '0e8a16',
+                description: 'Transaction validated and ready to settle',
+              });
+            } catch {}
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['approved'],
+            });
+            // Remove insufficient-funds label if present
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'insufficient-funds',
+              });
+            } catch {}
+
+      - name: Post rejection comment
+        if: steps.validate.outputs.result == 'insufficient-funds'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { from, to, amount, currency, note, sender_balance, tx_id } = {
+              from: '${{ steps.validate.outputs.from }}',
+              to: '${{ steps.validate.outputs.to }}',
+              amount: '${{ steps.validate.outputs.amount }}',
+              currency: '${{ steps.validate.outputs.currency }}',
+              note: '${{ steps.validate.outputs.note }}',
+              sender_balance: '${{ steps.validate.outputs.sender_balance }}',
+              tx_id: '${{ steps.validate.outputs.tx_id }}',
+            };
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ❌ Insufficient Funds',
+                '',
+                `| Field | Value |`,
+                `|-------|-------|`,
+                `| Transaction ID | \`${tx_id}\` |`,
+                `| From | **${from}** |`,
+                `| To | **${to}** |`,
+                `| Amount requested | **${amount} ${currency}** |`,
+                `| Sender current balance | ${sender_balance} ${currency} |`,
+                '',
+                `**${from}** does not have enough funds to cover this transfer. This PR cannot be merged.`,
+              ].join('\n'),
+            });
+
+      - name: Label insufficient-funds
+        if: steps.validate.outputs.result == 'insufficient-funds'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'insufficient-funds',
+                color: 'd93f0b',
+                description: 'Sender balance too low to settle this transaction',
+              });
+            } catch {}
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['insufficient-funds'],
+            });
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'approved',
+              });
+            } catch {}
+
+      - name: Block merge on insufficient funds
+        if: steps.validate.outputs.result == 'insufficient-funds'
+        run: |
+          echo "::error::Transaction rejected: insufficient funds."
+          exit 1
+
+      - name: Handle error
+        if: steps.validate.outputs.result == 'error'
+        run: |
+          echo "::error::${{ steps.validate.outputs.message }}"
+          exit 1

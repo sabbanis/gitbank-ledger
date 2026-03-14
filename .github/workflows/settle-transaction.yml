@@ -1,0 +1,137 @@
+name: Settle Transaction
+
+on:
+  pull_request:
+    types: [closed]
+    paths:
+      - 'transactions/**.json'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  settle:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find transaction file
+        id: find-tx
+        run: |
+          # List files that were changed in the merged PR
+          TX_FILE=$(git diff --name-only HEAD~1 HEAD \
+            | grep '^transactions/[^/]*\.json$' | head -1)
+          echo "tx_file=$TX_FILE" >> $GITHUB_OUTPUT
+          echo "Found transaction file: $TX_FILE"
+
+      - name: Settle transaction
+        id: settle
+        run: |
+          TX_FILE="${{ steps.find-tx.outputs.tx_file }}"
+
+          if [ -z "$TX_FILE" ]; then
+            echo "No transaction file found after merge — nothing to settle."
+            exit 0
+          fi
+
+          FROM=$(jq -r '.from' "$TX_FILE")
+          TO=$(jq -r '.to' "$TX_FILE")
+          AMOUNT=$(jq -r '.amount' "$TX_FILE")
+          CURRENCY=$(jq -r '.currency' "$TX_FILE")
+          TX_ID=$(jq -r '.id' "$TX_FILE")
+          STATUS=$(jq -r '.status' "$TX_FILE")
+
+          if [ "$STATUS" = "settled" ]; then
+            echo "Transaction $TX_ID already settled — skipping."
+            exit 0
+          fi
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Update sender balance
+          SENDER_BAL_FILE="balances/${FROM}.json"
+          OLD_SENDER=$(jq -r '.balance' "$SENDER_BAL_FILE")
+          NEW_SENDER=$(echo "$OLD_SENDER $AMOUNT" | awk '{printf "%.2f", $1 - $2}')
+          jq --argjson bal "$NEW_SENDER" --arg ts "$NOW" \
+            '.balance = $bal | .updatedAt = $ts' \
+            "$SENDER_BAL_FILE" > /tmp/sender_bal.json
+          mv /tmp/sender_bal.json "$SENDER_BAL_FILE"
+
+          # Update recipient balance
+          RECIP_BAL_FILE="balances/${TO}.json"
+          OLD_RECIP=$(jq -r '.balance' "$RECIP_BAL_FILE")
+          NEW_RECIP=$(echo "$OLD_RECIP $AMOUNT" | awk '{printf "%.2f", $1 + $2}')
+          jq --argjson bal "$NEW_RECIP" --arg ts "$NOW" \
+            '.balance = $bal | .updatedAt = $ts' \
+            "$RECIP_BAL_FILE" > /tmp/recip_bal.json
+          mv /tmp/recip_bal.json "$RECIP_BAL_FILE"
+
+          # Mark transaction settled
+          jq --arg ts "$NOW" '.status = "settled" | .settledAt = $ts' \
+            "$TX_FILE" > /tmp/tx_settled.json
+          mv /tmp/tx_settled.json "$TX_FILE"
+
+          # Copy to completed/
+          mkdir -p transactions/completed
+          cp "$TX_FILE" "transactions/completed/${TX_ID}.json"
+
+          echo "tx_id=$TX_ID" >> $GITHUB_OUTPUT
+          echo "from=$FROM" >> $GITHUB_OUTPUT
+          echo "to=$TO" >> $GITHUB_OUTPUT
+          echo "amount=$AMOUNT" >> $GITHUB_OUTPUT
+          echo "currency=$CURRENCY" >> $GITHUB_OUTPUT
+          echo "old_sender=$OLD_SENDER" >> $GITHUB_OUTPUT
+          echo "new_sender=$NEW_SENDER" >> $GITHUB_OUTPUT
+          echo "old_recip=$OLD_RECIP" >> $GITHUB_OUTPUT
+          echo "new_recip=$NEW_RECIP" >> $GITHUB_OUTPUT
+          echo "settled=true" >> $GITHUB_OUTPUT
+
+      - name: Commit settled balances
+        if: steps.settle.outputs.settled == 'true'
+        run: |
+          git config user.name "gitbank-bot"
+          git config user.email "gitbank-bot@users.noreply.github.com"
+          git add balances/ transactions/
+          git commit -m "settle: ${{ steps.settle.outputs.tx_id }} — ${{ steps.settle.outputs.from }} → ${{ steps.settle.outputs.to }} \$${{ steps.settle.outputs.amount }}"
+          git push
+
+      - name: Post settlement comment
+        if: steps.settle.outputs.settled == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { tx_id, from, to, amount, currency, old_sender, new_sender, old_recip, new_recip } = {
+              tx_id: '${{ steps.settle.outputs.tx_id }}',
+              from: '${{ steps.settle.outputs.from }}',
+              to: '${{ steps.settle.outputs.to }}',
+              amount: '${{ steps.settle.outputs.amount }}',
+              currency: '${{ steps.settle.outputs.currency }}',
+              old_sender: '${{ steps.settle.outputs.old_sender }}',
+              new_sender: '${{ steps.settle.outputs.new_sender }}',
+              old_recip: '${{ steps.settle.outputs.old_recip }}',
+              new_recip: '${{ steps.settle.outputs.new_recip }}',
+            };
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## 🏦 Transaction Settled',
+                '',
+                `Transaction \`${tx_id}\` has been settled.`,
+                '',
+                `| Account | Before | After |`,
+                `|---------|--------|-------|`,
+                `| **${from}** (sender) | ${old_sender} ${currency} | ${new_sender} ${currency} |`,
+                `| **${to}** (recipient) | ${old_recip} ${currency} | ${new_recip} ${currency} |`,
+                '',
+                'Balance files and transaction receipt committed to `main`.',
+              ].join('\n'),
+            });
